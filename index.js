@@ -2,10 +2,20 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const Razorpay = require("razorpay");
+const redis = require("redis");
+const util = require("util");
 require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+const redisClient = redis.createClient({
+  url: process.env.REDIS_URL || "redis://localhost:6379"
+});
+redisClient.on("error", (error) => console.error(`Redis error: ${error}`));
+redisClient.on("connect", () => console.log("Connected to Redis"));
+redisClient.get = util.promisify(redisClient.get);
+redisClient.set = util.promisify(redisClient.set);
 
 mongoose
   .connect(
@@ -61,7 +71,7 @@ app.post("/sign-in", async (req, res) => {
     } else {
       const newUser = new User({ email: email, credits: 5 });
       await newUser.save();
-      res.status(200).json({ user });
+      res.status(200).json({ newUser });
     }
   } catch (error) {
     console.error("Error fetching the User:", error);
@@ -82,28 +92,31 @@ app.post("/get-user", async (req, res) => {
 
 app.post("/shorten", async (req, res) => {
   const { originalUrl, email } = req.body;
-  // console.log(email);
   try {
     const user = await User.findOne({ email });
     if (user.credits > 0) {
-      try {
-        const existingUrl = await URL.findOne({ originalUrl });
-        if (existingUrl) {
-          res.json({ shortUrl: existingUrl.shortUrl });
-        } else {
-          const uniqueId = Date.now();
-          const shortCode = toBase62(uniqueId);
-          const shortUrl = `${req.protocol}://${req.get("host")}/${shortCode}`;
+      const cacheKey = `url:${originalUrl}`;
+      let shortUrl = await redisClient.get(cacheKey);
+      if (shortUrl) {
+        return res.json({ shortUrl });
+      }
 
-          const url = new URL({ originalUrl, shortUrl });
-          user.credits = user.credits - 1;
-          await url.save();
-          await user.save();
-          res.json({ shortUrl });
-        }
-      } catch (error) {
-        console.error("Error saving URL to database:", error);
-        res.status(500).json({ error: "Internal server error" });
+      const existingUrl = await URL.findOne({ originalUrl });
+      if (existingUrl) {
+        shortUrl = existingUrl.shortUrl;
+        await redisClient.set(cacheKey, shortUrl);
+        res.json({ shortUrl: existingUrl.shortUrl });
+      } else {
+        const uniqueId = Date.now();
+        const shortCode = toBase62(uniqueId);
+        shortUrl = `${req.protocol}://${req.get("host")}/${shortCode}`;
+
+        const url = new URL({ originalUrl, shortUrl });
+        user.credits = user.credits - 1;
+        await url.save();
+        await user.save();
+        await redisClient.set(cacheKey, shortUrl);
+        res.json({ shortUrl });
       }
     } else {
       res.status(200).json({ message: "Not enough credits" });
@@ -116,13 +129,20 @@ app.post("/shorten", async (req, res) => {
 
 app.get("/:shortCode", async (req, res) => {
   const { shortCode } = req.params;
+  const cacheKey = `shortUrl:${shortCode}`;
   try {
+    let originalUrl = await redisClient.get(cacheKey);
+    if (originalUrl) {
+      return res.redirect(originalUrl);
+    }
+
     const url = await URL.findOne({
       shortUrl: `${req.protocol}://${req.get("host")}/${shortCode}`,
     });
     if (!url) {
       return res.status(404).json({ error: "URL not found" });
     }
+    await redisClient.set(cacheKey, url.originalUrl);
     res.redirect(url.originalUrl);
   } catch (error) {
     console.error("Error fetching URL from database:", error);
